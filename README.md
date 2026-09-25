@@ -30,10 +30,22 @@ python3 app.py --db ./data.db --port 8324
 - `GET /api/records/{id}`：记录详情。
 - `GET /api/records/{id}/audit`：审计时间线。
 - `GET /api/stats`：状态统计。
-- `POST /api/records`：创建记录，请求体为`{"reference":"...","data":{...}}`。
+- `POST /api/records`：创建记录，请求体为`{"reference":"...","data":{...}}`，指令可带可选`counterparty`（清算对手）。
 - `POST /api/records/{id}/actions/{action}`：执行业务动作，请求体为`{"expected_version":1,"data":{...}}`。
+- `GET /api/netting-batches`：净额批次列表，可带`state`和`limit`参数。
+- `GET /api/netting-batches/{id}`：净额批次详情。
+- `GET /api/netting-batches/{id}/audit`：净额批次审计时间线。
+- `POST /api/netting-batches`：创建净额批次，请求体为`{"reference":"...","data":{"counterparty":"...","currency":"CNY","settlement_day":2,"member_ids":[1,2]}}`。
+- `POST /api/netting-batches/{id}/actions/{action}`：批次动作（`reconcile`核对、`review`复核完成），请求体为`{"expected_version":1,"data":{...}}`。
 
 除`/health`和`/`外，请求需提供`X-User-Id`、`X-Role`，可选`X-Org`。
+
+## 净额批次
+
+- 交易员创建批次，选入同一清算对手、币种和交收日的已复核指令，批次自动算出净数量与净金额；公司行动未应用的成员保留原单（`kept_original`），不参与净额。
+- 交易员用`reconcile`提交预期净额核对；核对不齐时整批停在`pending`并在`mismatch_members`中标出成员，一致则进入`pending_review`。
+- 结算专员用`review`复核，校验成员快照后在一个事务内完成批次成员指令交收，批次进入`completed`。
+- 成员指令被冲正时，已完成批次自动回到`pending_review`，批次变化均写入批次审计时间线。
 
 ## 测试
 
