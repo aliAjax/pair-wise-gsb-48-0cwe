@@ -1,13 +1,25 @@
 """证券结算与企业行动处理领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, integer_list, number, optional_text, text, text_list
 
 
 INITIAL_STATE = "captured"
 CREATE_ROLES = {'trader'}
 ACTION_ROLES = {'apply_corporate': {'corporate_actions'}, 'approve': {'settlement_officer'}, 'settle': {'settlement_officer'}, 'fail': {'settlement_officer'}, 'reverse': {'corporate_actions', 'settlement_officer'}}
 TRANSITIONS = {'apply_corporate': {'captured': 'adjusted'}, 'approve': {'captured': 'approved', 'adjusted': 'approved'}, 'settle': {'approved': 'settled'}, 'fail': {'approved': 'failed'}, 'reverse': {'settled': 'reversed', 'failed': 'reversed'}}
+
+BATCH_PENDING = "pending"
+BATCH_REVIEWING = "reviewing"
+BATCH_COMPLETED = "completed"
+BATCH_CREATE_ROLES = {'trader'}
+BATCH_ACTION_ROLES = {'submit_batch': {'trader'}, 'complete_batch': {'settlement_officer'}}
+BATCH_TRANSITIONS = {'submit_batch': {BATCH_PENDING: BATCH_REVIEWING}, 'complete_batch': {BATCH_REVIEWING: BATCH_COMPLETED}}
+FLAG_CORPORATE_PENDING = "corporate_action_pending"
+FLAG_KEY_MISMATCH = "batch_key_mismatch"
+FLAG_NOT_APPROVED = "not_approved"
+FLAG_REVERSED = "member_reversed"
+MAX_BATCH_MEMBERS = 500
 
 
 class DomainRules:
@@ -17,6 +29,8 @@ class DomainRules:
         all_roles = set(CREATE_ROLES)
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
+        for roles in BATCH_ACTION_ROLES.values():
+            all_roles.update(roles)
         return role == "admin" or role in all_roles
 
     def role_can_create(self, role: str) -> bool:
@@ -24,6 +38,12 @@ class DomainRules:
 
     def role_can_action(self, role: str, action: str) -> bool:
         return role == "admin" or role in ACTION_ROLES.get(action, set())
+
+    def role_can_create_batch(self, role: str) -> bool:
+        return role == "admin" or role in BATCH_CREATE_ROLES
+
+    def role_can_batch_action(self, role: str, action: str) -> bool:
+        return role == "admin" or role in BATCH_ACTION_ROLES.get(action, set())
 
     def validate_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         p = dict(payload)
@@ -34,6 +54,7 @@ class DomainRules:
         number(p, "fees", 0)
         choice(p, "currency", ["CNY", "USD", "HKD"])
         integer(p, "settlement_day", 0)
+        optional_text(p, "counterparty")
         choice(p, "corporate_action", ["none", "split", "dividend", "merger"])
         number(p, "action_ratio", 0.01)
         return p
@@ -100,3 +121,94 @@ class DomainRules:
             summary = "交收冲正"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    def validate_batch_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        p = dict(payload or {})
+        text(p, "counterparty")
+        choice(p, "currency", ["CNY", "USD", "HKD"])
+        integer(p, "settlement_day", 0)
+        integer_list(p, "member_ids", 1)
+        if len(p["member_ids"]) > MAX_BATCH_MEMBERS:
+            raise ValidationError("批次成员不能超过%s条" % MAX_BATCH_MEMBERS)
+        return p
+
+    def member_key(self, payload: Dict[str, Any]) -> Tuple[str, str, int]:
+        return payload.get("counterparty", ""), payload.get("currency"), int(payload.get("settlement_day"))
+
+    def signed_quantity(self, payload: Dict[str, Any]) -> int:
+        quantity = int(payload.get("effective_quantity", payload["adjusted_quantity"]))
+        return quantity if payload.get("side") == "buy" else -quantity
+
+    def compute_batch(self, key: Tuple[str, str, int], members: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """按对手/币种/交收日轧差。公司行动未应用等异常成员保留原单并标出。"""
+        member_snapshots: List[Dict[str, Any]] = []
+        net_quantity = 0
+        net_amount = 0.0
+        flags_present = False
+        for seq, member in enumerate(members):
+            p = member["payload"]
+            flags: List[str] = []
+            included = False
+            if member["state"] == "reversed":
+                flags.append(FLAG_REVERSED)
+            elif member["state"] not in {"approved", "settled"}:
+                flags.append(FLAG_NOT_APPROVED)
+            if not p.get("corporate_applied", False) and p.get("corporate_action", "none") != "none":
+                flags.append(FLAG_CORPORATE_PENDING)
+            if self.member_key(p) != key:
+                flags.append(FLAG_KEY_MISMATCH)
+            if not flags:
+                included = True
+                net_quantity += self.signed_quantity(p)
+                net_amount += float(p["net_amount"]) * (1 if p.get("side") == "buy" else -1)
+            else:
+                flags_present = True
+            member_snapshots.append({
+                "seq": seq,
+                "record_id": member["id"],
+                "reference": member["reference"],
+                "version": member["version"],
+                "state": member["state"],
+                "side": p.get("side"),
+                "included_in_net": included,
+                "flags": flags,
+                "signed_quantity": self.signed_quantity(p) if included else 0,
+                "signed_amount": round(float(p.get("net_amount", 0.0)) * (1 if p.get("side") == "buy" else -1), 2) if included else 0.0,
+                "effective_quantity": int(p.get("effective_quantity", p.get("adjusted_quantity", p.get("quantity")))),
+                "net_amount": float(p.get("net_amount", 0.0)),
+            })
+        net_quantity = int(net_quantity)
+        net_amount = round(net_amount, 2)
+        if net_quantity > 0:
+            net_side = "buy"
+        elif net_quantity < 0:
+            net_side = "sell"
+        else:
+            net_side = "flat"
+        return {
+            "counterparty": key[0],
+            "currency": key[1],
+            "settlement_day": key[2],
+            "state": BATCH_PENDING if flags_present else BATCH_REVIEWING,
+            "net_quantity": net_quantity,
+            "net_amount": net_amount,
+            "net_side": net_side,
+            "member_count": len(member_snapshots),
+            "included_count": sum(1 for item in member_snapshots if item["included_in_net"]),
+            "members": member_snapshots,
+        }
+
+    def require_batch_transition(self, batch: Dict[str, Any], action: str) -> str:
+        allowed = BATCH_TRANSITIONS.get(action, {}).get(batch["state"])
+        if allowed is None:
+            raise Conflict("当前批次状态不允许执行%s" % action)
+        return allowed
+
+    def validate_complete(self, plan: Dict[str, Any]) -> None:
+        for member in plan["members"]:
+            if not member["included_in_net"]:
+                if FLAG_REVERSED in member["flags"]:
+                    raise Conflict("成员已被冲正，请移除后重新提交")
+                raise Conflict("批次核对不齐，无法一次完成：成员%s %s" % (member["record_id"], "/".join(member["flags"])))
+            if member["state"] not in {"approved", "settled"}:
+                raise Conflict("成员%s状态已变化：%s" % (member["record_id"], member["state"]))

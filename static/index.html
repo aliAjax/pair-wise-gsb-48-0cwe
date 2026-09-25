@@ -6,10 +6,13 @@
   <title>证券结算与企业行动处理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
+    main { max-width: 1080px; margin: auto; }
     button { padding: .55rem .9rem; cursor: pointer; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin-bottom: .5rem; }
+    section { border-top: 1px solid #d8dee4; margin-top: 2rem; padding-top: 1rem; }
+    input { padding: .45rem; border: 1px solid #c2c8d0; border-radius: 6px; }
+    label { font-size: .85rem; color: #4b5563; }
   </style>
 </head>
 <body>
@@ -18,9 +21,27 @@
   <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
   <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
+
+  <section>
+    <h2>净额批次</h2>
+    <p>按清算对手、币种、交收日选入已复核指令轧差；公司行动未应用的成员保留原单并标出，核对不齐时整批停在待处理。</p>
+    <div class="row"><button id="load-batches">加载批次</button><button id="load-pending">仅待处理</button></div>
+    <div class="row">
+      <label>批次引用 <input id="b-ref" placeholder="NB-240901-01"></label>
+      <label>清算对手 <input id="b-cp" placeholder="CCP1"></label>
+      <label>币种
+        <select id="b-ccy"><option>CNY</option><option>USD</option><option>HKD</option></select>
+      </label>
+      <label>交收日 <input id="b-day" type="number" value="2" style="width:5rem"></label>
+      <label>成员指令ID(逗号分隔) <input id="b-members" placeholder="1,2,3"></label>
+      <button id="create-batch">交易员创建批次</button>
+    </div>
+    <p id="batch-hint" style="color:#6b7280;font-size:.85rem">批次动作：创建/更新/提交为交易员，完成/退回为结算专员。创建后输出中的id、version用于后续动作。</p>
+    <pre id="batch-output">尚未加载净额批次。</pre>
+  </section>
 </main>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
+const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo","Content-Type":"application/json"};
 async function show(path) {
   const response = await fetch(path, {headers});
   const data = await response.json();
@@ -28,6 +49,29 @@ async function show(path) {
 }
 document.getElementById("load").onclick = () => show("/api/records?limit=20");
 document.getElementById("stats").onclick = () => show("/api/stats");
+
+async function call(path, options) {
+  const response = await fetch(path, Object.assign({headers}, options || {}));
+  const data = await response.json();
+  document.getElementById("batch-output").textContent = JSON.stringify(data, null, 2);
+}
+function loadBatches(state) {
+  call("/api/batches?limit=50" + (state ? "&state=" + state : ""));
+}
+document.getElementById("load-batches").onclick = () => loadBatches("");
+document.getElementById("load-pending").onclick = () => loadBatches("pending");
+function batchForm() {
+  return {
+    counterparty: document.getElementById("b-cp").value.trim(),
+    currency: document.getElementById("b-ccy").value,
+    settlement_day: parseInt(document.getElementById("b-day").value, 10),
+    member_ids: document.getElementById("b-members").value.split(",").map(x => parseInt(x.trim(), 10)).filter(x => !Number.isNaN(x))
+  };
+}
+document.getElementById("create-batch").onclick = () => call("/api/batches", {
+  method: "POST",
+  body: JSON.stringify({reference: document.getElementById("b-ref").value.trim(), data: batchForm()})
+});
 </script>
 </body>
 </html>

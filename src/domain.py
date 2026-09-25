@@ -95,3 +95,12 @@ def text_list(data: Dict[str, Any], key: str, minimum: int = 0) -> List[str]:
     if len(value) < minimum:
         raise ValidationError("%s至少需要%s项" % (key, minimum))
     return [item.strip() for item in value]
+
+
+def integer_list(data: Dict[str, Any], key: str, minimum: int = 0) -> List[int]:
+    value = data.get(key, [])
+    if not isinstance(value, list) or any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise ValidationError("%s必须是整数列表" % key)
+    if len(value) < minimum:
+        raise ValidationError("%s至少需要%s项" % (key, minimum))
+    return [int(item) for item in value]

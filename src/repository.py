@@ -47,8 +47,37 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reference TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    payload TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS batch_members (
+                    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                    record_id INTEGER NOT NULL REFERENCES records(id),
+                    seq INTEGER NOT NULL,
+                    PRIMARY KEY (batch_id, record_id)
+                );
+                CREATE TABLE IF NOT EXISTS batch_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
+                CREATE INDEX IF NOT EXISTS idx_batch_members_record ON batch_members(record_id);
+                CREATE INDEX IF NOT EXISTS idx_batch_audit ON batch_audit_events(batch_id, id);
                 """
             )
 
@@ -141,6 +170,183 @@ class Repository:
         with self._connect() as connection:
             rows = connection.execute("SELECT state, COUNT(*) AS total FROM records GROUP BY state").fetchall()
         return {str(row["state"]): int(row["total"]) for row in rows}
+
+    def _batch_row(self, row: sqlite3.Row, connection: sqlite3.Connection) -> Dict[str, Any]:
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        members = connection.execute(
+            "SELECT record_id, seq FROM batch_members WHERE batch_id=? ORDER BY seq", (item["id"],)
+        ).fetchall()
+        item["member_ids"] = [int(member["record_id"]) for member in members]
+        return item
+
+    def get_batch(self, batch_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if row is None:
+                raise NotFound("批次不存在")
+            return self._batch_row(row, connection)
+
+    def get_batch_by_reference(self, reference: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM batches WHERE reference=?", (reference,)).fetchone()
+            if row is None:
+                return None
+            return self._batch_row(row, connection)
+
+    def list_batches(self, state: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connect() as connection:
+            if state:
+                rows = connection.execute("SELECT * FROM batches WHERE state=? ORDER BY id DESC LIMIT ?", (state, limit)).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM batches ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [self._batch_row(row, connection) for row in rows]
+
+    def active_batch_for_record(self, record_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT b.* FROM batch_members m JOIN batches b ON b.id = m.batch_id "
+                "WHERE m.record_id=? AND b.state!=? ORDER BY b.id DESC LIMIT 1",
+                (record_id, "completed"),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._batch_row(row, connection)
+
+    def batch_for_record_any_state(self, record_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT b.* FROM batch_members m JOIN batches b ON b.id = m.batch_id "
+                "WHERE m.record_id=? ORDER BY b.id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._batch_row(row, connection)
+
+    def add_batch_audit_only(self, batch_id: int, actor_id: str, action: str, details: Dict[str, Any]) -> None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT version FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if row is None:
+                raise NotFound("批次不存在")
+            connection.execute(
+                "INSERT INTO batch_audit_events(batch_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (batch_id, action, actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), _now()),
+            )
+
+    def create_batch(self, reference: str, state: str, payload: Dict[str, Any], member_ids: List[int], actor_id: str) -> Dict[str, Any]:
+        now = _now()
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO batches(reference,state,version,payload,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (reference, state, 1, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, actor_id, now, now),
+                )
+                batch_id = int(cursor.lastrowid)
+                connection.executemany(
+                    "INSERT INTO batch_members(batch_id,record_id,seq) VALUES(?,?,?)",
+                    [(batch_id, int(record_id), seq) for seq, record_id in enumerate(member_ids)],
+                )
+                connection.execute(
+                    "INSERT INTO batch_audit_events(batch_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                    (batch_id, "created", actor_id, 1, json.dumps({"state": state, "net_quantity": payload.get("net_quantity"), "net_amount": payload.get("net_amount")}, ensure_ascii=False, sort_keys=True), now),
+                )
+                row = connection.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+                result = self._batch_row(row, connection)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("批次引用冲突或成员已属于其他未完成批次") from exc
+        return result
+
+    def mutate_batch(self, batch_id: int, expected_version: int, state: str, payload: Dict[str, Any], member_ids: List[int], actor_id: str, action: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("批次不存在")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE batches SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                (state, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, batch_id),
+            )
+            connection.execute("DELETE FROM batch_members WHERE batch_id=?", (batch_id,))
+            connection.executemany(
+                "INSERT INTO batch_members(batch_id,record_id,seq) VALUES(?,?,?)",
+                [(batch_id, int(record_id), seq) for seq, record_id in enumerate(member_ids)],
+            )
+            connection.execute(
+                "INSERT INTO batch_audit_events(batch_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (batch_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = self._batch_row(connection.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone(), connection)
+            connection.commit()
+        return result
+
+    def complete_batch(self, batch_id: int, expected_version: int, payload: Dict[str, Any], settlements: Dict[int, Dict[str, Any]], actor_id: str) -> Dict[str, Any]:
+        """一次完成全部成员指令：批次与成员状态、审计在同一事务落库。"""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version,state FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("批次不存在")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            if str(row["state"]) != "reviewing":
+                connection.rollback()
+                raise Conflict("仅待复核批次可以完成")
+            for record_id, settlement in settlements.items():
+                record_row = connection.execute("SELECT version,state,payload FROM records WHERE id=?", (record_id,)).fetchone()
+                if record_row is None:
+                    connection.rollback()
+                    raise NotFound("成员指令不存在")
+                if str(record_row["state"]) != "approved":
+                    connection.rollback()
+                    raise Conflict("成员%s当前状态为%s，无法交收" % (record_id, record_row["state"]))
+                if int(record_row["version"]) != int(settlement["expected_version"]):
+                    connection.rollback()
+                    raise Conflict("成员%s版本冲突，请刷新后重试" % record_id)
+                record_version = int(record_row["version"]) + 1
+                connection.execute(
+                    "UPDATE records SET state='settled',version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                    (record_version, json.dumps(settlement["payload"], ensure_ascii=False, sort_keys=True), actor_id, now, record_id),
+                )
+                connection.execute(
+                    "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                    (record_id, "settle", actor_id, record_version,
+                     json.dumps({"summary": "净额批次一次交收完成", "batch_id": batch_id, "input": {"delivered_quantity": settlement["payload"].get("delivered_quantity"), "cash_paid": settlement["payload"].get("cash_paid")}, "from": "approved", "to": "settled"}, ensure_ascii=False, sort_keys=True), now),
+                )
+            batch_version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE batches SET state='completed',version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                (batch_version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, batch_id),
+            )
+            connection.execute(
+                "INSERT INTO batch_audit_events(batch_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (batch_id, "complete_batch", actor_id, batch_version,
+                 json.dumps({"summary": "结算专员复核后一次完成成员指令", "member_count": len(settlements), "net_quantity": payload.get("net_quantity"), "net_amount": payload.get("net_amount"), "from": "reviewing", "to": "completed"}, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = self._batch_row(connection.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone(), connection)
+            connection.commit()
+        return result
+
+    def batch_audit_timeline(self, batch_id: int) -> List[Dict[str, Any]]:
+        self.get_batch(batch_id)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM batch_audit_events WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item["details"])
+            result.append(item)
+        return result
 
     def health(self) -> bool:
         try:
